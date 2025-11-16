@@ -47,7 +47,7 @@ typedef struct {
 
   uint8_t limit_high : 4;
   uint8_t reserved_for_os : 1;
-  uint8_t reserved : 1;
+  uint8_t long_mode : 1;
 
   // 0: 16 bit
   // 1: 32 bit
@@ -58,6 +58,21 @@ typedef struct {
 
   uint8_t base_high; // 基地址高8位
 } __attribute__((packed)) gdt_entry_t;
+
+const uint32_t PAGE_SIZE = 4096;
+typedef uint64_t page_table_entry_t;
+#define PT_WRITABLE_SHIFT 1
+#define PT_USER_SHIFT 2
+#define PT_PRESENT_MASK (1ULL << 0)
+#define PT_WRITABLE_MASK (1ULL << PT_WRITABLE_SHIFT)
+#define PT_USER_MASK (1ULL << PT_USER_SHIFT)
+#define PT_DIRTY_SHIFT 6
+#define PT_DIRTY_MASK (1ULL << PT_DIRTY_SHIFT)
+#define PT_PAGE_SIZE_SHIFT 7
+#define PT_PAGE_SIZE_MASK (1ULL << PT_PAGE_SIZE_SHIFT)
+
+#define PT_ADDRESS_MASK 0x000ffffffffff000ULL
+#define PT_GET_ADDRESS(pt) (pt & PT_ADDRESS_MASK)
 
 int main(int argc, char **argv) {
   int kvm_fd;
@@ -73,7 +88,7 @@ int main(int argc, char **argv) {
   }
 
   void *mem;
-  if ((mem = mmap(NULL, 1 << 30, PROT_READ | PROT_WRITE,
+  if ((mem = mmap(NULL, 1 << 16, PROT_READ | PROT_WRITE,
                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) ==
       NULL) {
     fprintf(stderr, "mmap failed: %d\n", errno);
@@ -84,7 +99,7 @@ int main(int argc, char **argv) {
   memset(&region, 0, sizeof(region));
   region.slot = 0;
   region.guest_phys_addr = 0;
-  region.memory_size = 1 << 30;
+  region.memory_size = 1 << 16;
   region.userspace_addr = (uintptr_t)mem;
   if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
     fprintf(stderr, "ioctl KVM_SET_USER_MEMORY_REGION failed: %d\n", errno);
@@ -124,29 +139,33 @@ int main(int argc, char **argv) {
       .segment_is_in_memory = 1,
       .limit_high = 0x0F,
       .reserved_for_os = 0,
-      .reserved = 0,
-      .segment_type = 1,
+      .long_mode = 1,
+      .segment_type = 0,
       .granularity = 1,
       .base_high = 0x00,
   };
-  gdt_entry[2] = (gdt_entry_t){
-      .limit_low = 0xFFFF,
-      .base_low = 0x0000,
-      .base_mid = 0x00,
-      .access_bit = 0,
-      .readable_and_writable = 1,
-      .expansion_direction = 0,
-      .executable_segment = 0,
-      .descriptor_bit = 1,
-      .descriptor_privilege_level = 0,
-      .segment_is_in_memory = 1,
-      .limit_high = 0x0F,
-      .reserved_for_os = 0,
-      .reserved = 0,
-      .segment_type = 1,
-      .granularity = 1,
-      .base_high = 0x00,
-  };
+
+  page_table_entry_t *plm4_entry =
+      (page_table_entry_t *)((char *)mem + PAGE_SIZE);
+  memset(plm4_entry, 0, PAGE_SIZE);
+  plm4_entry[0] = PT_PRESENT_MASK | PT_WRITABLE_MASK | (2 * PAGE_SIZE);
+
+  page_table_entry_t *pdpt_entry =
+      (page_table_entry_t *)((char *)mem + PT_GET_ADDRESS(plm4_entry[0]));
+  memset(pdpt_entry, 0, PAGE_SIZE);
+  pdpt_entry[0] = PT_PRESENT_MASK | PT_WRITABLE_MASK | (3 * PAGE_SIZE);
+
+  page_table_entry_t *pd_entry =
+      (page_table_entry_t *)((char *)mem + PT_GET_ADDRESS(pdpt_entry[0]));
+  memset(pd_entry, 0, PAGE_SIZE);
+  pd_entry[0] = PT_PRESENT_MASK | PT_WRITABLE_MASK | (4 * PAGE_SIZE);
+
+  page_table_entry_t *pt_entry =
+      (page_table_entry_t *)((char *)mem + PT_GET_ADDRESS(pd_entry[0]));
+  memset(pt_entry, 0, PAGE_SIZE);
+  for (size_t i = 0; i < 256; i++) {
+    pt_entry[i] = PT_PRESENT_MASK | PT_WRITABLE_MASK | (i * PAGE_SIZE);
+  }
 
   int vcpu_fd;
   if ((vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
@@ -172,9 +191,17 @@ int main(int argc, char **argv) {
   }
 
   sregs.gdt.base = 0;
-  sregs.gdt.limit = 24 - 1;
+  sregs.gdt.limit = 16 - 1;
 
-  sregs.cr0 |= 1; // enable PE
+  sregs.cr0 |= (1ULL << 0ULL);  // enable PE
+  sregs.cr0 |= (1ULL << 31ULL); // enable PG
+
+  sregs.cr3 = PAGE_SIZE; // page table base addr
+
+  sregs.cr4 |= (1 << 5); // enable PAE
+
+  sregs.efer |= (1 << 8);  // enable LME
+  sregs.efer |= (1 << 10); // enable LMA
 
   const int32_t gdt_index = 1;
   const gdt_entry_t *gdt = &gdt_entry[gdt_index];
@@ -190,7 +217,7 @@ int main(int argc, char **argv) {
   sregs.cs.present = 1;            // 段存在
   sregs.cs.db = gdt->segment_type; // Default operation size / Big flag
   sregs.cs.s = gdt->descriptor_bit;
-  sregs.cs.l = 0;                // 长模式
+  sregs.cs.l = gdt->long_mode;   // 长模式
   sregs.cs.g = gdt->granularity; // 粒度标志
   sregs.cs.avl = gdt->reserved_for_os;
   sregs.cs.unusable = 0; // 段可用
@@ -217,7 +244,7 @@ int main(int argc, char **argv) {
   memset(&regs, 0, sizeof(regs));
   regs.rflags = 2;
 
-  regs.rip = 128;
+  regs.rip = (4 * 1024) * 8; // system use first 8 pages
   regs.rsp = 0x00000000000ff000;
 
   regs.rax = 0x0000000000000006;
@@ -243,13 +270,26 @@ int main(int argc, char **argv) {
       printf("kvm halt\n");
       struct kvm_regs output_regs;
       if (ioctl(vcpu_fd, KVM_GET_REGS, &(output_regs)) < 0) {
-        perror("KVM SET REGS\n");
+        perror("KVM GET REGS\n");
         return 1;
       }
-      printf("rax=%llu\n", output_regs.rax);
+      printf("r11 = %llu\n", output_regs.r11);
+      struct kvm_sregs output_sregs;
+      if (ioctl(vcpu_fd, KVM_GET_SREGS, &(output_sregs)) < 0) {
+        perror("KVM GET SREGS\n");
+        return 1;
+      }
+      printf("output_sregs.cs.l = %u\n", (uint32_t)output_sregs.cs.l);
+      goto exit;
+    case KVM_EXIT_SHUTDOWN:
+      printf("kvm shutdown\n");
       goto exit;
     case KVM_EXIT_INTERNAL_ERROR:
       printf("KVM_EXIT_INTERNAL_ERROR: suberror=%u\n", run->internal.suberror);
+      goto exit;
+    case KVM_EXIT_FAIL_ENTRY:
+      printf("KVM_EXIT_FAIL_ENTRY: suberror=%llx\n",
+             run->fail_entry.hardware_entry_failure_reason);
       goto exit;
     default:
       printf("exit reason: %d\n", run->exit_reason);
