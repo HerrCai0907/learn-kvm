@@ -18,6 +18,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 
 #include "WasmImportExportType.hpp"
@@ -1075,6 +1076,8 @@ void Frontend::parseCodeSection() {
 
     uint32_t const functionBodySize{br_.readLEB128<uint32_t>()};
     uint8_t const *const functionPosAfterSize{br_.getPtr()};
+
+    std::cout << "compiling function " << fncIndex << " at output [" << compiler_.output_.size() << "]\n";
 
 #if ENABLE_EXTENSIONS
     extension::IDwarf5Generator *const dwarfGenerator{compiler_.getDwarfGenerator()};
