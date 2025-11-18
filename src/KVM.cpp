@@ -8,7 +8,6 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
-#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <linux/kvm.h>
@@ -17,7 +16,6 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <vector>
 
 namespace wasm_kvm {
 
@@ -103,10 +101,18 @@ constexpr static size_t TRAMPOLINE_LOC = GDT_LOC + GDT_ITEM_COUNT * GDT_ITEM_SIZ
 
 constexpr static size_t PML4_LOC = PAGE_SIZE;
 
-constexpr static size_t JOB_START_VA = 2U * GB; // 8GB
-constexpr static size_t JOB_START_PA = 2U * GB; // 8GB
+constexpr static size_t JOB_START_VA = 16 * GB;
+constexpr static size_t JOB_START_PA = 2 * GB;
 
-constexpr static size_t INIT_STACK_LOC = 0xF000;
+constexpr static size_t JOB_STACK_VA = 4 * GB;
+constexpr static size_t JOB_STACK_SIZE = 1 * MB;
+constexpr static size_t JOB_STACK_PA = 2 * GB;
+
+enum class PageKind {
+  Size1GB,
+  Size2MB,
+  Size4KB,
+};
 
 class KVMManager {
 public:
@@ -116,7 +122,7 @@ public:
   void *mem_ = MAP_FAILED;
   int kvm_run_mmap_size_ = 0;
   kvm_run *run_ = nullptr;
-  size_t freePageTableLoc_ = PML4_LOC;
+  size_t freePageTableLoc_ = PML4_LOC + PAGE_SIZE;
 
   ~KVMManager();
 
@@ -128,7 +134,7 @@ public:
   void initTrampoline();
   bool initCPU();
 
-  void addPageTableEntry(uint64_t virtualAddress, uint64_t physicalAddress, size_t size);
+  void addPageTableEntry(uint64_t virtualAddress, uint64_t physicalAddress, PageKind kind);
 
   vb::Span<uint8_t> getCodeSpan() {
     // only 1 job supported yet
@@ -204,27 +210,18 @@ void KVMManager::initMemory() {
   gdt[1].base_high = 0x00U;
 
   page_table_entry_t *plm4_entry = reinterpret_cast<page_table_entry_t *>(static_cast<char *>(mem_) + PML4_LOC);
-  freePageTableLoc_ += PAGE_SIZE;
   memset(plm4_entry, 0, PAGE_SIZE);
-  plm4_entry[0] = PT_PRESENT_MASK | PT_WRITABLE_MASK | freePageTableLoc_;
 
-  page_table_entry_t *pdpt_entry = reinterpret_cast<page_table_entry_t *>(static_cast<char *>(mem_) + PT_GET_ADDRESS(plm4_entry[0]));
-  freePageTableLoc_ += PAGE_SIZE;
-  memset(pdpt_entry, 0, PAGE_SIZE);
-  pdpt_entry[0] = PT_PRESENT_MASK | PT_WRITABLE_MASK | PT_PAGE_SIZE_MASK | 0U;
+  addPageTableEntry(0ULL, 0ULL, PageKind::Size1GB);
 }
 
-void KVMManager::addPageTableEntry(uint64_t virtualAddress, uint64_t physicalAddress, size_t size) {
-  // < 1GB reserved for OS
-  assert(virtualAddress >= 1U * GB);
-  assert(physicalAddress >= 1U * GB);
-  assert(size < PAGE_SIZE && "NYI");
-
+void KVMManager::addPageTableEntry(uint64_t virtualAddress, uint64_t physicalAddress, PageKind kind) {
   size_t const pml4Index = (virtualAddress >> 39U) & 0x1FFU; // 47-39位
   size_t const pdptIndex = (virtualAddress >> 30U) & 0x1FFU; // 38-30位
   size_t const pdtIndex = (virtualAddress >> 21U) & 0x1FFU;  // 29-21位
   size_t const ptIndex = (virtualAddress >> 12U) & 0x1FFU;   // 20-12位
 
+  // PML4
   page_table_entry_t *pml4Entry = reinterpret_cast<page_table_entry_t *>(static_cast<char *>(mem_) + PML4_LOC);
   size_t pdptLoc = 0U;
   if (PT_PRESENT_MASK != (pml4Entry[pml4Index] & PT_PRESENT_MASK)) {
@@ -232,37 +229,72 @@ void KVMManager::addPageTableEntry(uint64_t virtualAddress, uint64_t physicalAdd
     freePageTableLoc_ += PAGE_SIZE;
     memset(static_cast<uint8_t *>(mem_) + pdptLoc, 0, PAGE_SIZE);
     pml4Entry[pml4Index] = PT_PRESENT_MASK | PT_WRITABLE_MASK | pdptLoc;
+    std::cout << "add PML4 item: va 0x" << std::hex << virtualAddress << std::dec << std::endl;
   } else {
     pdptLoc = PT_GET_ADDRESS(pml4Entry[pml4Index]);
+    std::cout << "has PML4 item: va 0x" << std::hex << virtualAddress << std::dec << " pdptLoc " << pdptLoc << std::endl;
   }
 
+  // PDPT
   page_table_entry_t *pdptEntry = reinterpret_cast<page_table_entry_t *>(static_cast<char *>(mem_) + pdptLoc);
+  if (kind == PageKind::Size1GB) {
+    if (PT_PRESENT_MASK != (pdptEntry[pdptIndex] & PT_PRESENT_MASK)) {
+      std::cout << "  add PDPT item[" << pdptIndex << "]: va 0x" << std::hex << virtualAddress << " as 1GB page point to 0x" << physicalAddress
+                << std::dec << "\n";
+      pdptEntry[pdptIndex] = PT_PRESENT_MASK | PT_WRITABLE_MASK | PT_PAGE_SIZE_MASK | physicalAddress;
+    } else {
+      std::cout << "  has PDPT item: va 0x" << std::hex << virtualAddress << " pa 0x" << PT_GET_ADDRESS(pdptEntry[pdptIndex]) << std::dec
+                << std::endl;
+      assert((pdptEntry[pdptIndex] & PT_PAGE_SIZE_MASK) == PT_PAGE_SIZE_MASK);
+      assert(physicalAddress == PT_GET_ADDRESS(pdptEntry[pdptIndex]));
+    }
+    return;
+  }
   size_t pdtLoc = 0U;
   if (PT_PRESENT_MASK != (pdptEntry[pdptIndex] & PT_PRESENT_MASK)) {
     pdtLoc = freePageTableLoc_;
     freePageTableLoc_ += PAGE_SIZE;
     memset(static_cast<uint8_t *>(mem_) + pdtLoc, 0, PAGE_SIZE);
     pdptEntry[pdptIndex] = PT_PRESENT_MASK | PT_WRITABLE_MASK | pdtLoc;
+    std::cout << "  add PDPT item[" << pdptIndex << "]: va 0x" << std::hex << virtualAddress << std::dec << std::endl;
   } else {
     pdtLoc = PT_GET_ADDRESS(pdptEntry[pdptIndex]);
+    std::cout << "  has PDPT item: va 0x" << std::hex << virtualAddress << std::dec << " pdptLoc " << pdtLoc << std::endl;
   }
 
+  // PDT
   page_table_entry_t *pdtEntry = reinterpret_cast<page_table_entry_t *>(static_cast<char *>(mem_) + pdtLoc);
+  if (kind == PageKind::Size2MB) {
+    if (PT_PRESENT_MASK != (pdtEntry[pdtIndex] & PT_PRESENT_MASK)) {
+      std::cout << "    add PPT item[" << pdtIndex << "]: va 0x" << std::hex << virtualAddress << " as 1GB page point to 0x" << physicalAddress
+                << std::dec << "\n";
+      pdtEntry[pdtIndex] = PT_PRESENT_MASK | PT_WRITABLE_MASK | PT_PAGE_SIZE_MASK | physicalAddress;
+    } else {
+      std::cout << "    has PPT item: va 0x" << std::hex << virtualAddress << " pa 0x" << PT_GET_ADDRESS(pdtEntry[pdtIndex]) << std::dec << std::endl;
+      assert((pdtEntry[pdtIndex] & PT_PAGE_SIZE_MASK) == PT_PAGE_SIZE_MASK);
+      assert(physicalAddress == PT_GET_ADDRESS(pdtEntry[pdtIndex]));
+    }
+    return;
+  }
   size_t ptLoc = 0U;
   if (PT_PRESENT_MASK != (pdtEntry[pdtIndex] & PT_PRESENT_MASK)) {
     ptLoc = freePageTableLoc_;
     freePageTableLoc_ += PAGE_SIZE;
     memset(static_cast<uint8_t *>(mem_) + ptLoc, 0, PAGE_SIZE);
     pdtEntry[pdtIndex] = PT_PRESENT_MASK | PT_WRITABLE_MASK | ptLoc;
+    std::cout << "    add PDT item[" << pdtIndex << "]: va 0x" << std::hex << virtualAddress << std::dec << std::endl;
   } else {
     ptLoc = PT_GET_ADDRESS(pdtEntry[pdtIndex]);
   }
 
+  // PT
   page_table_entry_t *ptEntry = reinterpret_cast<page_table_entry_t *>(static_cast<char *>(mem_) + ptLoc);
   if (PT_PRESENT_MASK != (ptEntry[ptIndex] & PT_PRESENT_MASK)) {
     freePageTableLoc_ += PAGE_SIZE;
     memset(static_cast<uint8_t *>(mem_) + ptLoc, 0, PAGE_SIZE);
     ptEntry[ptIndex] = PT_PRESENT_MASK | PT_PAGE_SIZE_MASK | PT_WRITABLE_MASK | physicalAddress;
+    std::cout << "      add PT item[" << ptIndex << "]: va 0x" << std::hex << virtualAddress << "as 4kB page point to 0x" << physicalAddress
+              << std::dec << "\n";
   } else {
     assert(physicalAddress == PT_GET_ADDRESS(ptEntry[ptIndex]));
   }
@@ -388,15 +420,16 @@ int main() {
   regs.rflags = 2;
 
   regs.rip = TRAMPOLINE_LOC; // system use first 8 pages
-  regs.rsp = INIT_STACK_LOC;
+  regs.rsp = JOB_STACK_VA + JOB_STACK_SIZE;
+  kvmManager.addPageTableEntry(JOB_STACK_VA, JOB_STACK_PA, PageKind::Size1GB);
 
   WARP warp{};
   vb::WasmModule::CompileResult compileResult = warp.compile(readBinaryFile("/home/q540239/learn-kvm/add.wasm"));
   uint32_t const totalSize = warp.initializeModule(compileResult.getModule().span(), kvmManager.getCodeSpan(), nullptr);
-  kvmManager.addPageTableEntry(JOB_START_VA, JOB_START_PA, totalSize);
+  kvmManager.addPageTableEntry(JOB_START_VA, JOB_START_PA, (totalSize >= 4 * KB) ? PageKind::Size2MB : PageKind::Size4KB); // FIXME
 
   regs.rax = JOB_START_VA + 492; // trampoline will call rax
-  regs.rbx = JOB_START_VA + (warp.getLinearMemoryBaseOffset() - JOB_START_PA);
+  regs.rbx = JOB_START_VA + warp.getLinearMemoryBaseOffset();
   regs.rbp = 10; // wasm-compiler wasm abi arg 0
   regs.rdi = 21; // wasm-compiler wasm abi arg 1
 
@@ -418,14 +451,19 @@ int main() {
       printf("IO port: %d, data: 0x%x\n", kvmManager.run_->io.port, io_data);
       break;
     }
+    case KVM_EXIT_MMIO: {
+      printf("KVM_EXIT_MMIO: phys_addr=0x%llx, len=%u, is_write=%u\n", kvmManager.run_->mmio.phys_addr, kvmManager.run_->mmio.len,
+             kvmManager.run_->mmio.is_write);
+      break;
+    }
     case KVM_EXIT_HLT:
-      printf("kvm halt\n");
       struct kvm_regs output_regs;
       if (ioctl(kvmManager.vcpuHandler_, KVM_GET_REGS, &(output_regs)) < 0) {
         perror("KVM GET REGS\n");
         return 1;
       }
       printf("rax = %llu\n", output_regs.rax);
+      printf("kvm halt\n");
       goto exit;
     case KVM_EXIT_SHUTDOWN:
       printf("kvm shutdown\n");
