@@ -487,7 +487,7 @@ int main(int argc, char **argv) {
 
   struct kvm_regs regs;
   memset(&regs, 0, sizeof(regs));
-  regs.rflags = 2;
+  regs.rflags = 0x0200;
 
   regs.rip = loc.entry_;
   regs.rsp = JOB_STACK_VA + JOB_STACK_SIZE;
