@@ -188,6 +188,14 @@ bool KVMManager::initialize() {
     return false;
   }
 
+  if (ioctl(vmHandler_, KVM_CREATE_IRQCHIP) < 0) {
+    perror("KVM_CREATE_IRQCHIP");
+    return false;
+  }
+  struct kvm_irqchip irq{.chip_id = 2};
+  ioctl(vmHandler_, KVM_GET_IRQCHIP, &irq);
+  std::cout << "ioapic id " << irq.chip.ioapic.id << std::endl;
+
   mem_ = ::mmap(NULL, MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (mem_ == MAP_FAILED) {
     return false;
@@ -203,12 +211,13 @@ bool KVMManager::initialize() {
     return false;
   }
 
-  kvm_run_mmap_size_ = ::ioctl(kvmHandler_, KVM_GET_VCPU_MMAP_SIZE, 0);
+  kvm_run_mmap_size_ = ::ioctl(kvmHandler_, KVM_GET_VCPU_MMAP_SIZE);
   if (kvm_run_mmap_size_ < 0) {
     return false;
   }
   vcpuHandler_ = ::ioctl(vmHandler_, KVM_CREATE_VCPU, 0);
   if (vcpuHandler_ < 0) {
+    perror("KVM_CREATE_VCPU");
     return false;
   }
   run_ = static_cast<kvm_run *>(::mmap(NULL, static_cast<size_t>(kvm_run_mmap_size_), PROT_READ | PROT_WRITE, MAP_SHARED, vcpuHandler_, 0));
@@ -457,7 +466,7 @@ int main(int argc, char **argv) {
   using namespace wasm_kvm;
 
   KVMManager kvmManager{};
-  kvmManager.initialize();
+  bool const isInitialized = kvmManager.initialize();
   kvmManager.initMemory();
   kvmManager.initCPU();
   KVMManager::TrampolineLoc loc = kvmManager.initTrampolineCode();
