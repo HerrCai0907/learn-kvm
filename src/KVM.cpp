@@ -90,14 +90,20 @@ constexpr size_t PAGE_SIZE = 4U * KB;
 constexpr static size_t MEMORY_SIZE = 4U * GB;
 
 // guest phy memory layout
-// GDT_LOC + TRAMPOLINE_LOC (4k)
-// PML4_LOC | ... page tables ... | ... free page tables ... | (1GB)
-// JOB_START_LOC (rest)
+// 0kB: IDT + GDT + TRAMPOLINE
+// 4KB: PML4 | ... page tables ... | ... free page tables ...
+// 1GB: STACK
+// 2GB: JOB_START (rest)
 
-constexpr static size_t GDT_LOC = 0U;
+constexpr static size_t IDT_LOC = 0U;
+constexpr static size_t IDT_ITEM_COUNT = 64U; // we don't use all idt yet
+constexpr static size_t IDT_ITEM_SIZE = 16U;
+
+constexpr static size_t GDT_LOC = IDT_LOC + IDT_ITEM_COUNT * IDT_ITEM_SIZE;
 constexpr static size_t GDT_ITEM_COUNT = 2U;
 constexpr static size_t GDT_ITEM_SIZE = 8U;
-constexpr static size_t TRAMPOLINE_LOC = GDT_LOC + GDT_ITEM_COUNT * GDT_ITEM_SIZE; // gdt 2 entries, each 8 bytes + padding
+
+constexpr static size_t TRAMPOLINE_LOC = GDT_LOC + GDT_ITEM_COUNT * GDT_ITEM_SIZE;
 
 constexpr static size_t PML4_LOC = PAGE_SIZE;
 
@@ -106,7 +112,7 @@ constexpr static size_t JOB_START_PA = 2 * GB;
 
 constexpr static size_t JOB_STACK_VA = 4 * GB;
 constexpr static size_t JOB_STACK_SIZE = 1 * MB;
-constexpr static size_t JOB_STACK_PA = 2 * GB;
+constexpr static size_t JOB_STACK_PA = 1 * GB;
 
 enum class PageKind {
   Size1GB,
@@ -141,7 +147,7 @@ public:
     return {static_cast<uint8_t *>(mem_) + JOB_START_PA, MEMORY_SIZE - JOB_START_PA};
   }
 
-  vb::Span<gdt_entry_t> getGDT() { return vb::Span<gdt_entry_t>{static_cast<gdt_entry_t *>(mem_), 2}; }
+  vb::Span<gdt_entry_t> getGDT() { return vb::Span<gdt_entry_t>{reinterpret_cast<gdt_entry_t *>(static_cast<uint8_t *>(mem_) + GDT_LOC), 2}; }
 };
 
 bool KVMManager::initialize() {
@@ -334,6 +340,10 @@ bool KVMManager::initCPU() {
 
   sregs.efer |= (1 << 8);  // enable LME
   sregs.efer |= (1 << 10); // enable LMA
+
+  // https://wiki.osdev.org/Interrupt_Descriptor_Table
+  sregs.idt.base = 0;
+  sregs.idt.limit = 0;
 
   constexpr int gdt_index = 1;
   gdt_entry_t gdt = getGDT()[gdt_index];
