@@ -1,4 +1,5 @@
 {
   "editor.formatOnSave": true,
-  "cSpell.words": ["PDPT"]
+  "cSpell.words": ["PDPT"],
+  "clangd.arguments": ["--compile-commands-dir=build"]
 }

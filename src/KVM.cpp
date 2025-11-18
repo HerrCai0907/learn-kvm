@@ -1,13 +1,16 @@
 #include "WARP.hpp"
 #include "src/WasmModule/WasmModule.hpp"
 #include "src/core/common/Span.hpp"
+#include <atomic>
 #include <cassert>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <linux/kvm.h>
@@ -15,11 +18,22 @@
 #include <string>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <thread>
 #include <unistd.h>
 
 namespace wasm_kvm {
 
 namespace {
+
+struct __attribute__((packed)) InterruptDescriptor64 {
+  uint16_t offset_1;       // offset bits 0..15
+  uint16_t selector;       // a code segment selector in GDT or LDT
+  uint8_t ist;             // bits 0..2 holds Interrupt Stack Table offset, rest of bits zero.
+  uint8_t type_attributes; // gate type, dpl, and p fields
+  uint16_t offset_2;       // offset bits 16..31
+  uint32_t offset_3;       // offset bits 32..63
+  uint32_t zero;           // reserved
+};
 
 struct __attribute__((packed)) gdt_entry_t {
   uint16_t limit_low; // 段限长低16位
@@ -137,7 +151,13 @@ public:
   bool isUninitialized() const { return kvmHandler_ < 0 && vmHandler_ < 0 && mem_ == MAP_FAILED && vcpuHandler_ < 0 && run_ == nullptr; }
 
   void initMemory();
-  void initTrampoline();
+
+  struct TrampolineLoc {
+    size_t entry_;
+    size_t page_fault_;
+    size_t div_zero_;
+  };
+  TrampolineLoc initTrampolineCode();
   bool initCPU();
 
   void addPageTableEntry(uint64_t virtualAddress, uint64_t physicalAddress, PageKind kind);
@@ -147,7 +167,12 @@ public:
     return {static_cast<uint8_t *>(mem_) + JOB_START_PA, MEMORY_SIZE - JOB_START_PA};
   }
 
-  vb::Span<gdt_entry_t> getGDT() { return vb::Span<gdt_entry_t>{reinterpret_cast<gdt_entry_t *>(static_cast<uint8_t *>(mem_) + GDT_LOC), 2}; }
+  vb::Span<gdt_entry_t> getGDT() {
+    return vb::Span<gdt_entry_t>{reinterpret_cast<gdt_entry_t *>(static_cast<uint8_t *>(mem_) + GDT_LOC), GDT_ITEM_COUNT};
+  }
+  vb::Span<InterruptDescriptor64> getIDT() {
+    return vb::Span<InterruptDescriptor64>{reinterpret_cast<InterruptDescriptor64 *>(static_cast<uint8_t *>(mem_) + IDT_LOC), IDT_ITEM_COUNT};
+  }
 };
 
 bool KVMManager::initialize() {
@@ -196,6 +221,7 @@ bool KVMManager::initialize() {
 
 void KVMManager::initMemory() {
   assert(isInitialized());
+  // gdt
   vb::Span<gdt_entry_t> gdt = getGDT();
   memset(&gdt[0], 0, sizeof(gdt_entry_t)); // 根据要求，第一个 gdt 为空
   gdt[1].limit_low = 0xFFFFU;
@@ -215,9 +241,9 @@ void KVMManager::initMemory() {
   gdt[1].granularity = 1U;
   gdt[1].base_high = 0x00U;
 
+  // page table
   page_table_entry_t *plm4_entry = reinterpret_cast<page_table_entry_t *>(static_cast<char *>(mem_) + PML4_LOC);
   memset(plm4_entry, 0, PAGE_SIZE);
-
   addPageTableEntry(0ULL, 0ULL, PageKind::Size1GB);
 }
 
@@ -306,10 +332,13 @@ void KVMManager::addPageTableEntry(uint64_t virtualAddress, uint64_t physicalAdd
   }
 }
 
-void KVMManager::initTrampoline() {
+KVMManager::TrampolineLoc KVMManager::initTrampolineCode() {
   assert(isInitialized());
   char *trampoline = static_cast<char *>(mem_) + TRAMPOLINE_LOC;
   size_t i = 0;
+
+  TrampolineLoc loc{};
+  loc.entry_ = TRAMPOLINE_LOC + i;
   // out 10, ax
   trampoline[i++] = 0x66;
   trampoline[i++] = 0xE7;
@@ -319,6 +348,14 @@ void KVMManager::initTrampoline() {
   trampoline[i++] = 0xD0;
   // hlt
   trampoline[i++] = 0xF4;
+
+  loc.page_fault_ = TRAMPOLINE_LOC + i;
+  trampoline[i++] = 0xF4;
+
+  loc.div_zero_ = TRAMPOLINE_LOC + i;
+  trampoline[i++] = 0xF4;
+
+  return loc;
 }
 
 bool KVMManager::initCPU() {
@@ -342,8 +379,8 @@ bool KVMManager::initCPU() {
   sregs.efer |= (1 << 10); // enable LMA
 
   // https://wiki.osdev.org/Interrupt_Descriptor_Table
-  sregs.idt.base = 0;
-  sregs.idt.limit = 0;
+  sregs.idt.base = IDT_LOC;
+  sregs.idt.limit = IDT_ITEM_COUNT * IDT_ITEM_SIZE - 1;
 
   constexpr int gdt_index = 1;
   gdt_entry_t gdt = getGDT()[gdt_index];
@@ -415,7 +452,7 @@ std::string readBinaryFile(std::string const &path) {
   return std::move(buffer).str();
 }
 
-int main() {
+int main(int argc, char **argv) {
   vb::WasmModule::initEnvironment(malloc, realloc, free);
   using namespace wasm_kvm;
 
@@ -423,20 +460,49 @@ int main() {
   kvmManager.initialize();
   kvmManager.initMemory();
   kvmManager.initCPU();
-  kvmManager.initTrampoline();
+  KVMManager::TrampolineLoc loc = kvmManager.initTrampolineCode();
+
+  // idt
+  vb::Span<InterruptDescriptor64> idt = kvmManager.getIDT();
+  memset(idt.data(), 0, idt.size() * sizeof(InterruptDescriptor64));
+  enum class IDTItem : size_t {
+    DivideError = 0x00,
+    PageFault = 0x0E,
+  };
+  idt[static_cast<size_t>(IDTItem::DivideError)].selector = 8; // code segment
+  idt[static_cast<size_t>(IDTItem::DivideError)].ist = 0;
+  idt[static_cast<size_t>(IDTItem::DivideError)].type_attributes = 0b1'00'0'1111ULL; // interrupt gate
+  idt[static_cast<size_t>(IDTItem::DivideError)].zero = 0;
+  idt[static_cast<size_t>(IDTItem::DivideError)].offset_1 = (loc.div_zero_ >> 0U) & 0xFFFFU;
+  idt[static_cast<size_t>(IDTItem::DivideError)].offset_2 = (loc.div_zero_ >> 16U) & 0xFFFFU;
+  idt[static_cast<size_t>(IDTItem::DivideError)].offset_3 = (loc.div_zero_ >> 32U) & 0xFFFFFFFFU;
+
+  idt[static_cast<size_t>(IDTItem::PageFault)].selector = 8; // code segment
+  idt[static_cast<size_t>(IDTItem::PageFault)].ist = 0;
+  idt[static_cast<size_t>(IDTItem::PageFault)].type_attributes = 0b1'00'0'1111ULL; // interrupt gate
+  idt[static_cast<size_t>(IDTItem::PageFault)].zero = 0;
+  idt[static_cast<size_t>(IDTItem::PageFault)].offset_1 = (loc.page_fault_ >> 0U) & 0xFFFFU;
+  idt[static_cast<size_t>(IDTItem::PageFault)].offset_2 = (loc.page_fault_ >> 16U) & 0xFFFFU;
+  idt[static_cast<size_t>(IDTItem::PageFault)].offset_3 = (loc.page_fault_ >> 32U) & 0xFFFFFFFFU;
 
   struct kvm_regs regs;
   memset(&regs, 0, sizeof(regs));
   regs.rflags = 2;
 
-  regs.rip = TRAMPOLINE_LOC; // system use first 8 pages
+  regs.rip = loc.entry_;
   regs.rsp = JOB_STACK_VA + JOB_STACK_SIZE;
   kvmManager.addPageTableEntry(JOB_STACK_VA, JOB_STACK_PA, PageKind::Size1GB);
 
   WARP warp{};
-  vb::WasmModule::CompileResult compileResult = warp.compile(readBinaryFile("/home/q540239/learn-kvm/add.wasm"));
+  vb::WasmModule::CompileResult compileResult =
+      warp.compile(readBinaryFile(std::filesystem::path{__FILE__}.parent_path().parent_path() / (std::string{argv[1]} + ".wasm")));
   uint32_t const totalSize = warp.initializeModule(compileResult.getModule().span(), kvmManager.getCodeSpan(), nullptr);
   kvmManager.addPageTableEntry(JOB_START_VA, JOB_START_PA, (totalSize >= 4 * KB) ? PageKind::Size2MB : PageKind::Size4KB); // FIXME
+
+  for (size_t i = 0x200; i < 0x220; ++i) {
+    std::cout << std::hex << static_cast<uint32_t>(kvmManager.getCodeSpan()[i]) << " ";
+  }
+  std::cout << std::endl;
 
   regs.rax = JOB_START_VA + 492; // trampoline will call rax
   regs.rbx = JOB_START_VA + warp.getLinearMemoryBaseOffset();
@@ -466,18 +532,33 @@ int main() {
              kvmManager.run_->mmio.is_write);
       break;
     }
-    case KVM_EXIT_HLT:
+    case KVM_EXIT_HLT: {
       struct kvm_regs output_regs;
       if (ioctl(kvmManager.vcpuHandler_, KVM_GET_REGS, &(output_regs)) < 0) {
         perror("KVM GET REGS\n");
         return 1;
       }
-      printf("rax = %llu\n", output_regs.rax);
-      printf("kvm halt\n");
+      std::cout << "pc = 0x" << std::hex << output_regs.rip << std::dec << std::endl;
+      if (output_regs.rip - 1U == loc.page_fault_) {
+        printf("kvm page fault\n");
+      } else if (output_regs.rip - 1U == loc.div_zero_) {
+        printf("kvm divide by zero\n");
+      } else {
+        printf("rax = %llu\n", output_regs.rax);
+        printf("kvm halt\n");
+      }
       goto exit;
-    case KVM_EXIT_SHUTDOWN:
+    }
+    case KVM_EXIT_SHUTDOWN: {
+      struct kvm_regs output_regs;
+      if (ioctl(kvmManager.vcpuHandler_, KVM_GET_REGS, &(output_regs)) < 0) {
+        perror("KVM GET REGS\n");
+        return 1;
+      }
+      printf("pc = 0x%llx\n", output_regs.rip);
       printf("kvm shutdown\n");
       goto exit;
+    }
     case KVM_EXIT_INTERNAL_ERROR:
       printf("KVM_EXIT_INTERNAL_ERROR: suberror=%u\n", kvmManager.run_->internal.suberror);
       goto exit;
