@@ -185,20 +185,9 @@ bool KVMManager::initialize() {
     return false;
   }
   // config
-  kvm_run_mmap_size_ = ::ioctl(kvmHandler_, KVM_GET_VCPU_MMAP_SIZE);
+  kvm_run_mmap_size_ = ::ioctl(kvmHandler_, KVM_GET_VCPU_MMAP_SIZE, 0);
   if (kvm_run_mmap_size_ < 0) {
     perror("KVM_GET_VCPU_MMAP_SIZE");
-    return false;
-  }
-
-  // ram
-  run_ = static_cast<kvm_run *>(::mmap(NULL, static_cast<size_t>(kvm_run_mmap_size_), PROT_READ | PROT_WRITE, MAP_SHARED, vcpuHandler_, 0));
-  if (run_ == nullptr) {
-    perror("mmap");
-    return false;
-  }
-  mem_ = ::mmap(NULL, MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-  if (mem_ == MAP_FAILED) {
     return false;
   }
 
@@ -207,28 +196,38 @@ bool KVMManager::initialize() {
   if (vmHandler_ < 0) {
     return false;
   }
-
   if (ioctl(vmHandler_, KVM_CREATE_IRQCHIP, 0) < 0) {
     perror("KVM_CREATE_IRQCHIP");
     return false;
   }
-
-  vcpuHandler_ = ::ioctl(vmHandler_, KVM_CREATE_VCPU, 110);
+  vcpuHandler_ = ::ioctl(vmHandler_, KVM_CREATE_VCPU, 0);
   if (vcpuHandler_ < 0) {
     perror("KVM_CREATE_VCPU");
     return false;
   }
-  struct kvm_userspace_memory_region region;
-  std::memset(&region, 0, sizeof(region));
-  region.slot = 0;
-  region.guest_phys_addr = 0;
-  region.memory_size = MEMORY_SIZE;
-  region.userspace_addr = reinterpret_cast<uintptr_t>(mem_);
+  run_ = static_cast<kvm_run *>(::mmap(NULL, static_cast<size_t>(kvm_run_mmap_size_), PROT_READ | PROT_WRITE, MAP_SHARED, vcpuHandler_, 0));
+  if (run_ == MAP_FAILED) {
+    perror("mmap");
+    return false;
+  }
+
+  // ram
+  mem_ = ::mmap(NULL, MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (mem_ == MAP_FAILED) {
+    perror("mmap");
+    return false;
+  }
+  struct kvm_userspace_memory_region region{
+      .slot = 0,
+      .flags = 0,
+      .guest_phys_addr = 0,
+      .memory_size = MEMORY_SIZE,
+      .userspace_addr = reinterpret_cast<uintptr_t>(mem_),
+  };
   if (::ioctl(vmHandler_, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
     perror("KVM_SET_USER_MEMORY_REGION");
     return false;
   }
-
   return true;
 }
 
