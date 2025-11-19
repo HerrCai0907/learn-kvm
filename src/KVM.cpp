@@ -104,6 +104,9 @@ constexpr size_t PAGE_SIZE = 4U * KB;
 
 constexpr static size_t MEMORY_SIZE = 4U * GB;
 
+constexpr static size_t MMIO_BASE = 0;
+constexpr static size_t MMIO_SIZE = 4 * KB;
+
 // guest phy memory layout
 // 4GB: base offset
 
@@ -145,27 +148,34 @@ enum class PageKind {
 
 class KVMManager {
   void *mem_ = MAP_FAILED;
+  void *mmio_ = MAP_FAILED;
 
 public:
   int kvmHandler_ = -1;
   int vmHandler_ = -1;
   int vcpuHandler_ = -1;
   int kvm_run_mmap_size_ = 0;
-  kvm_run *run_ = nullptr;
+  kvm_run *run_ = static_cast<kvm_run *>(MAP_FAILED);
   size_t freePageTableLoc_ = PML4_LOC + PAGE_SIZE;
 
   ~KVMManager();
 
   bool initialize();
-  bool isInitialized() const { return kvmHandler_ >= 0 && vmHandler_ >= 0 && mem_ != MAP_FAILED && vcpuHandler_ >= 0 && run_ != nullptr; }
-  bool isUninitialized() const { return kvmHandler_ < 0 && vmHandler_ < 0 && mem_ == MAP_FAILED && vcpuHandler_ < 0 && run_ == nullptr; }
+  bool isInitialized() const {
+    return kvmHandler_ >= 0 && vmHandler_ >= 0 && vcpuHandler_ >= 0 && mem_ != MAP_FAILED && mmio_ != MAP_FAILED && run_ != MAP_FAILED;
+  }
+  bool isUninitialized() const {
+    return kvmHandler_ < 0 && vmHandler_ < 0 && vcpuHandler_ < 0 && mem_ == MAP_FAILED && mmio_ == MAP_FAILED && run_ == MAP_FAILED;
+  }
 
   void initMemory();
 
   struct TrampolineLoc {
     size_t entry_;
+    size_t return_;
     size_t page_fault_;
     size_t div_zero_;
+    size_t mmio_size_;
   };
   TrampolineLoc initTrampolineCode();
   bool initCPU();
@@ -220,22 +230,42 @@ bool KVMManager::initialize() {
     return false;
   }
 
-  // ram
-  mem_ = ::mmap(NULL, MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-  if (mem_ == MAP_FAILED) {
-    perror("mmap");
-    return false;
+  { // mmio
+    mmio_ = ::mmap(NULL, MMIO_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (mmio_ == MAP_FAILED) {
+      perror("mmap");
+      return false;
+    }
+    struct kvm_userspace_memory_region region{
+        .slot = 0x4,
+        .flags = KVM_MEM_READONLY,
+        .guest_phys_addr = MMIO_BASE,
+        .memory_size = MMIO_SIZE,
+        .userspace_addr = reinterpret_cast<uintptr_t>(mmio_),
+    };
+    if (::ioctl(vmHandler_, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+      perror("KVM_SET_USER_MEMORY_REGION");
+      return false;
+    }
   }
-  struct kvm_userspace_memory_region region{
-      .slot = 1,
-      .flags = 0,
-      .guest_phys_addr = BASE_OFFSET,
-      .memory_size = MEMORY_SIZE,
-      .userspace_addr = reinterpret_cast<uintptr_t>(mem_),
-  };
-  if (::ioctl(vmHandler_, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-    perror("KVM_SET_USER_MEMORY_REGION");
-    return false;
+
+  { // ram
+    mem_ = ::mmap(NULL, MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (mem_ == MAP_FAILED) {
+      perror("mmap");
+      return false;
+    }
+    struct kvm_userspace_memory_region region{
+        .slot = 0,
+        .flags = 0,
+        .guest_phys_addr = BASE_OFFSET,
+        .memory_size = MEMORY_SIZE,
+        .userspace_addr = reinterpret_cast<uintptr_t>(mem_),
+    };
+    if (::ioctl(vmHandler_, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+      perror("KVM_SET_USER_MEMORY_REGION");
+      return false;
+    }
   }
   return true;
 }
@@ -265,6 +295,8 @@ void KVMManager::initMemory() {
   // page table
   page_table_entry_t *plm4_entry = reinterpret_cast<page_table_entry_t *>(getPhysicalMemoryBase() + PML4_LOC);
   memset(plm4_entry, 0, PAGE_SIZE);
+  static_assert(MMIO_SIZE == 4 * KB, "");
+  addPageTableEntry(MMIO_BASE, MMIO_BASE, PageKind::Size4KB);
   addPageTableEntry(BASE_OFFSET, BASE_OFFSET, PageKind::Size1GB);
 }
 
@@ -353,6 +385,19 @@ void KVMManager::addPageTableEntry(uint64_t virtualAddress, uint64_t physicalAdd
   }
 }
 
+size_t writeMMIO(uint8_t *base, uint8_t number) {
+  size_t i = 0;
+  base[i++] = 0xC6;
+  base[i++] = 0x04;
+  base[i++] = 0x25;
+  base[i++] = number;
+  base[i++] = 0x00;
+  base[i++] = 0x00;
+  base[i++] = 0x00;
+  base[i++] = 0x01;
+  return i;
+}
+
 KVMManager::TrampolineLoc KVMManager::initTrampolineCode() {
   assert(isInitialized());
   uint8_t *paBase = getPhysicalMemoryBase();
@@ -363,17 +408,23 @@ KVMManager::TrampolineLoc KVMManager::initTrampolineCode() {
   // out 10, ax
   paBase[i++] = 0x66;
   paBase[i++] = 0xE7;
-  paBase[i++] = 0x0A;
+  paBase[i++] = 0x00;
   // call rax
   paBase[i++] = 0xFF;
   paBase[i++] = 0xD0;
-  // hlt
-  paBase[i++] = 0xF4;
+  // mmio
+  loc.return_ = i;
+  size_t const offset = writeMMIO(paBase + i, 0x2);
+  loc.mmio_size_ = offset;
+  i += offset;
+
+  i += 0x10;
 
   loc.page_fault_ = i;
-  paBase[i++] = 0xF4;
+  i += writeMMIO(paBase + i, 0x10);
 
   loc.div_zero_ = i;
+  i += writeMMIO(paBase + i, 0x11);
   paBase[i++] = 0xF4;
 
   return loc;
@@ -523,10 +574,12 @@ int main(int argc, char **argv) {
   uint32_t const totalSize = warp.initializeModule(compileResult.getModule().span(), kvmManager.getCodeSpan(), nullptr);
   kvmManager.addPageTableEntry(JOB_START_VA, JOB_START_PA, (totalSize >= 4 * KB) ? PageKind::Size2MB : PageKind::Size4KB); // FIXME
 
-  regs.rax = JOB_START_VA + 492; // trampoline will call rax
+  regs.rax = JOB_START_VA + 0x1ec; // trampoline will call rax
   regs.rbx = JOB_START_VA + warp.getLinearMemoryBaseOffset();
   regs.rbp = 10; // wasm-compiler wasm abi arg 0
   regs.rdi = 21; // wasm-compiler wasm abi arg 1
+  uint64_t stackTrace = JOB_STACK_VA + JOB_STACK_SIZE + 16;
+  std::memcpy(&kvmManager.getPhysicalMemoryBase()[JOB_START_PA + warp.getLinearMemoryBaseOffset() - 0x98], &stackTrace, 8);
 
   if (ioctl(kvmManager.vcpuHandler_, KVM_SET_REGS, &(regs)) < 0) {
     perror("KVM SET REGS\n");
@@ -547,25 +600,29 @@ int main(int argc, char **argv) {
       break;
     }
     case KVM_EXIT_MMIO: {
-      printf("KVM_EXIT_MMIO: phys_addr=0x%llx, len=%u, is_write=%u\n", kvmManager.run_->mmio.phys_addr, kvmManager.run_->mmio.len,
-             kvmManager.run_->mmio.is_write);
-      break;
-    }
-    case KVM_EXIT_HLT: {
       struct kvm_regs output_regs;
       if (ioctl(kvmManager.vcpuHandler_, KVM_GET_REGS, &(output_regs)) < 0) {
-        perror("KVM GET REGS\n");
+        perror("KVM GET REGS");
         return 1;
       }
+      std::cout << std::hex << loc.return_ << " " << loc.page_fault_ << " " << loc.div_zero_ << std::endl;
       std::cout << "pc = 0x" << std::hex << output_regs.rip << std::dec << std::endl;
-      if (output_regs.rip - 1U == loc.page_fault_) {
-        printf("kvm page fault\n");
-      } else if (output_regs.rip - 1U == loc.div_zero_) {
-        printf("kvm divide by zero\n");
+      if (output_regs.rip == loc.mmio_size_) {
+        printf("exit due to page fault\n");
+        assert(kvmManager.run_->mmio.phys_addr == 0x10U);
+      } else if (output_regs.rip == loc.div_zero_ + loc.mmio_size_) {
+        printf("exit due to divide by zero\n");
+        assert(kvmManager.run_->mmio.phys_addr == 0x11U);
+      } else if (output_regs.rip == loc.return_ + loc.mmio_size_) {
+        printf("finish wasm call with rax = %lld\n", output_regs.rax);
+        assert(kvmManager.run_->mmio.phys_addr == 0x2U);
       } else {
-        printf("rax = %llu\n", output_regs.rax);
-        printf("kvm halt\n");
+        std::cout << "rbx = 0x" << std::hex << output_regs.rbx << std::dec << std::endl;
       }
+      goto exit;
+    }
+    case KVM_EXIT_HLT: {
+      printf("kvm halt\n");
       goto exit;
     }
     case KVM_EXIT_SHUTDOWN: {
